@@ -20,6 +20,8 @@ project_root/
     data_generation/
       generate_train_data.py        # synthesise training CIM + auction data
       generate_test_data.py         # synthesise test CIM + auction data
+    data_plots/
+      plot_auction_curve.py         # visualise D-1 auction MID curve + regimes
     check_data.py                   # validate a dataset
 
   src/
@@ -27,15 +29,15 @@ project_root/
     environment.py       # MultiHourMarketEnv — episode = one full trading day
     threshold_policy.py  # AlphaPolicy (α₁–α₅, σ_X, σ_Y) + regime computation
     reinforce_trainer.py # REINFORCEAgent — REINFORCE update loop
+    parallel_worker.py   # fork-based worker functions for parallel training/eval
     ri_benchmark.py      # rolling-intrinsic LP benchmark (Appendix E)
     training_logger.py   # per-episode metrics + training plots
     eval_plots.py        # six diagnostic evaluation figures
 
   outputs/
-    models/              # saved policy checkpoints (.pt)
-    plots/               # training figures
-    eval_plots/          # evaluation figures
-    logs/                # training logs
+    runs/                # timestamped run directories (model.pt, hparams.txt,
+                         #   training/ plots, eval/ plots) — not tracked
+    data_plots/          # auction curve visualisations (.gitkeep tracked)
 
   train.py               # training entry point
   test.py                # quick greedy evaluation (rewards only)
@@ -69,6 +71,20 @@ venv/bin/python3 scripts/check_data.py train
 venv/bin/python3 scripts/check_data.py test
 ```
 
+**Plot D-1 auction MID curve:**
+```bash
+# Day 0 of the training split
+venv/bin/python3 scripts/data_plots/plot_auction_curve.py --day 0
+
+# Overlay buy/sell regime segmentation
+venv/bin/python3 scripts/data_plots/plot_auction_curve.py --day 0 --show-regimes
+
+# Test split, specific day
+venv/bin/python3 scripts/data_plots/plot_auction_curve.py --split test --day 5 --show-regimes
+```
+
+Figures are saved to `outputs/data_plots/`.
+
 ## Train
 
 ```bash
@@ -93,29 +109,33 @@ Key flags:
 | `--reps` | 4 | Repetitions over training days per phase |
 | `--curriculum` | off | Three-phase frequency curriculum |
 | `--lr` | 1e-3 | Adam learning rate |
-| `--out` | `outputs/models/policy_multihour.pt` | Checkpoint path |
+| `--out` | `outputs/runs/<timestamp>/model.pt` | Checkpoint path |
 | `--seed` | None | RNG seed; fixed defaults used if omitted |
 | `--n-levels` | 1 | Quantity discretisation levels per side |
+| `--workers` | 1 | Parallel worker processes (Linux/WSL2 only; set to CPU core count for speedup) |
 
-Saves a `.pt` checkpoint containing `state_dict`, `param_snapshot`, and training metadata.
+Each run creates a timestamped directory under `outputs/runs/` containing `model.pt`, `hparams.txt`, training plots (`training/`), and evaluation plots (`eval/`). Pass `--out` to override the output path.
 
 ## Evaluate
 
 **Quick evaluation** (greedy policy, reports per-day rewards and summary stats):
 ```bash
-venv/bin/python3 test.py --model outputs/models/policy_multihour.pt
-venv/bin/python3 test.py --model outputs/models/policy_multihour.pt --days 10
+venv/bin/python3 test.py --model outputs/runs/<timestamp>/model.pt
+venv/bin/python3 test.py --model outputs/runs/<timestamp>/model.pt --days 10
 ```
 
 **Full evaluation** (greedy policy + 6 diagnostic plots, optional RI-LP comparison):
 ```bash
-venv/bin/python3 evaluate.py --model outputs/models/policy_multihour.pt
+venv/bin/python3 evaluate.py --model outputs/runs/<timestamp>/model.pt
 
 # Include rolling-intrinsic LP benchmark (slow — one LP solve per tick)
-venv/bin/python3 evaluate.py --model outputs/models/policy_multihour.pt --with-ri
+venv/bin/python3 evaluate.py --model outputs/runs/<timestamp>/model.pt --with-ri
+
+# Parallel evaluation across CPU cores
+venv/bin/python3 evaluate.py --model outputs/runs/<timestamp>/model.pt --workers 8
 ```
 
-Evaluation plots saved to `outputs/eval_plots/`:
+When the model path is `outputs/runs/<timestamp>/model.pt`, evaluation plots are saved alongside the model in `outputs/runs/<timestamp>/eval/`. Otherwise they go to `outputs/eval_plots/`.
 1. Performance distribution — histogram of policy vs RI-LP rewards
 2. Daily reward time series
 3. Intraday trading behaviour — price landscape + position buildup for example days

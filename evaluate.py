@@ -5,14 +5,15 @@ Runs the greedy policy and the RI-LP benchmark on every test day, collects
 per-day and per-tick metrics, then generates six diagnostic figures.
 
 Usage:
-    venv/bin/python3 evaluate.py --model outputs/models/policy_multihour.pt
-    venv/bin/python3 evaluate.py --model outputs/models/policy_multihour.pt \\
+    venv/bin/python3 evaluate.py --model outputs/runs/<timestamp>/model.pt
+    venv/bin/python3 evaluate.py --model outputs/runs/<timestamp>/model.pt \\
                                  --plot-dir outputs/eval_plots --stride 15
 """
 
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import sys
 from pathlib import Path
 
@@ -121,6 +122,14 @@ def _run_policy_episode(
 # ── Main evaluation loop ───────────────────────────────────────────────────────
 
 def evaluate(args: argparse.Namespace) -> None:
+    # ── Resolve output directory ───────────────────────────────────────────────
+    model_path = Path(args.model)
+    if args.plot_dir is None:
+        if model_path.name == "model.pt":
+            args.plot_dir = str(model_path.parent / "eval")
+        else:
+            args.plot_dir = "outputs/eval_plots"
+
     # ── Load model ─────────────────────────────────────────────────────────────
     ckpt = torch.load(args.model, map_location="cpu")
     print(f"Loaded model: {args.model}")
@@ -176,55 +185,141 @@ def evaluate(args: argparse.Namespace) -> None:
     print(f"\n{header}")
     print("─" * len(header))
 
-    for day_idx, (day, delivery_starts, session_start) in enumerate(day_index):
-        day_cim = cim[cim["delivery_start"].isin(delivery_starts)]
-        day_auc = auc[auc["delivery_start"].isin(delivery_starts)]
+    _fast = not args.with_lp_ri
 
-        auction_mids = day_auction_mids(day_auc, delivery_starts)
-        if auction_mids is None or auction_mids.max() - auction_mids.min() <= 0:
-            continue
+    if args.workers > 1:
+        # ── Parallel evaluation ───────────────────────────────────────────────
+        import src.parallel_worker as _pw
+        _pw._g_cim       = cim
+        _pw._g_auc       = auc
+        _pw._g_day_index = day_index
 
-        # RI-LP benchmark (opt-in — expensive: one LP solve per tick)
-        if args.with_ri:
-            ri_reward = run_ri_benchmark(
-                env, day_cim, delivery_starts, session_start, tick_stride=stride
+        policy_sd = {
+            k: v.detach().clone() for k, v in agent.policy.state_dict().items()
+        }
+        tasks = [
+            {
+                "ep_idx"        : day_idx,
+                "policy_sd"     : policy_sd,
+                "round_trip_eff": efficiency,
+                "n_levels"      : n_levels,
+                "env_kwargs"    : dict(
+                    capacity_mwh             = env.capacity,
+                    max_charge_mw            = env.max_charge,
+                    max_discharge_mw         = env.max_discharge,
+                    efficiency               = env.one_way_eff ** 2,
+                    initial_soc_mwh          = env.initial_soc,
+                    terminal_penalty_eur_mwh = env.terminal_penalty,
+                ),
+                "tick_stride"   : stride,
+                "fast"          : _fast,
+                "with_ri"       : args.with_ri,
+                "record_ticks"  : day_idx in example_idxs,
+                "td_sample_every": 5,
+            }
+            for day_idx in range(n_days)
+        ]
+
+        print(f"  dispatching {n_days} days to {args.workers} workers …")
+        with multiprocessing.get_context("fork").Pool(args.workers) as pool:
+            raw_results = pool.map(_pw.eval_episode_worker, tasks)
+
+        for res in raw_results:
+            day_idx = res["ep_idx"]
+            day     = res["date"]
+            if res.get("skip"):
+                continue
+
+            policy_reward = res["policy_reward"]
+            ri_reward     = res["ri_reward"]
+
+            if args.with_ri:
+                ratio = (
+                    (policy_reward / ri_reward)
+                    if abs(ri_reward) > 1e-3
+                    else float("nan")
+                )
+                print(f"{day_idx:4d}  {policy_reward:12.2f}  {ri_reward:12.2f}  {ratio:7.3f}")
+            else:
+                print(f"{day_idx:4d}  {policy_reward:12.2f}")
+
+            # Build TickRecord objects from the raw dicts returned by the worker
+            tick_recs = None
+            if res["tick_records"] is not None:
+                from src.eval_plots import TickRecord as _TR
+                tick_recs = [_TR(**tr) for tr in res["tick_records"]]
+
+            results.append(DayResult(
+                date             = day,
+                idx              = day_idx,
+                policy_reward    = policy_reward,
+                ri_reward        = ri_reward,
+                final_soc        = res["final_soc"],
+                revenue_per_hour = res["revenue_per_hour"],
+                tick_records     = tick_recs,
+            ))
+
+            # Merge per-day ThresholdData
+            td_raw = res["td"]
+            td.mu_Y.extend(td_raw["mu_Y"])
+            td.bid.extend(td_raw["bid"])
+            td.mu_X.extend(td_raw["mu_X"])
+            td.ask.extend(td_raw["ask"])
+            td.hour.extend(td_raw["hour"])
+
+    else:
+        # ── Sequential evaluation (original behaviour) ────────────────────────
+        for day_idx, (day, delivery_starts, session_start) in enumerate(day_index):
+            day_cim = cim[cim["delivery_start"].isin(delivery_starts)]
+            day_auc = auc[auc["delivery_start"].isin(delivery_starts)]
+
+            auction_mids = day_auction_mids(day_auc, delivery_starts)
+            if auction_mids is None or auction_mids.max() - auction_mids.min() <= 0:
+                continue
+
+            if args.with_ri:
+                ri_reward = run_ri_benchmark(
+                    env, day_cim, delivery_starts, session_start, tick_stride=stride
+                )
+            else:
+                ri_reward = float("nan")
+
+            agent.set_episode(
+                auction_mids,
+                capacity    = env.capacity,
+                initial_soc = env.initial_soc,
+                max_charge  = env.max_charge,
+                max_dis     = env.max_discharge,
             )
-        else:
-            ri_reward = float("nan")
 
-        # Policy — set regime info before episode
-        agent.set_episode(
-            auction_mids,
-            capacity    = env.capacity,
-            initial_soc = env.initial_soc,
-            max_charge  = env.max_charge,
-            max_dis     = env.max_discharge,
-        )
+            record = day_idx in example_idxs
+            policy_reward, final_soc, rev_per_hour, tick_recs = _run_policy_episode(
+                env, agent, day_cim, delivery_starts, session_start,
+                tick_stride    = stride,
+                record_ticks   = record,
+                threshold_data = td,
+                fast           = _fast,
+            )
 
-        record = day_idx in example_idxs
-        policy_reward, final_soc, rev_per_hour, tick_recs = _run_policy_episode(
-            env, agent, day_cim, delivery_starts, session_start,
-            tick_stride   = stride,
-            record_ticks  = record,
-            threshold_data= td,
-            fast          = not args.with_lp_ri,
-        )
+            if args.with_ri:
+                ratio = (
+                    (policy_reward / ri_reward)
+                    if abs(ri_reward) > 1e-3
+                    else float("nan")
+                )
+                print(f"{day_idx:4d}  {policy_reward:12.2f}  {ri_reward:12.2f}  {ratio:7.3f}")
+            else:
+                print(f"{day_idx:4d}  {policy_reward:12.2f}")
 
-        if args.with_ri:
-            ratio = (policy_reward / ri_reward) if abs(ri_reward) > 1e-3 else float("nan")
-            print(f"{day_idx:4d}  {policy_reward:12.2f}  {ri_reward:12.2f}  {ratio:7.3f}")
-        else:
-            print(f"{day_idx:4d}  {policy_reward:12.2f}")
-
-        results.append(DayResult(
-            date            = day,
-            idx             = day_idx,
-            policy_reward   = policy_reward,
-            ri_reward       = ri_reward,
-            final_soc       = final_soc,
-            revenue_per_hour= rev_per_hour,
-            tick_records    = tick_recs,
-        ))
+            results.append(DayResult(
+                date             = day,
+                idx              = day_idx,
+                policy_reward    = policy_reward,
+                ri_reward        = ri_reward,
+                final_soc        = final_soc,
+                revenue_per_hour = rev_per_hour,
+                tick_records     = tick_recs,
+            ))
 
     if not results:
         print("No valid test days found.")
@@ -275,7 +370,15 @@ if __name__ == "__main__":
              "but slow: one LP per tick). Default: fast auction-mid approximation."
     )
     parser.add_argument(
-        "--plot-dir", type=str, default="outputs/eval_plots", dest="plot_dir",
-        help="Directory for output plots (default: outputs/eval_plots)"
+        "--plot-dir", type=str, default=None, dest="plot_dir",
+        help="Directory for output plots (default: <run_dir>/eval/ if model is "
+             "outputs/runs/.../model.pt, else outputs/eval_plots)"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="Parallel worker processes for evaluation.  "
+             "N>1 evaluates all days concurrently (including RI-LP benchmark "
+             "when --with-ri is set) using fork-based multiprocessing. "
+             "Linux/WSL2 only.  Default: 1 (sequential)."
     )
     evaluate(parser.parse_args())

@@ -22,3 +22,11 @@ data/test/cim_order_book.csv
 
 # Logs
 outputs/logs/
+
+# Generated outputs (models, plots, run artefacts)
+outputs/models/
+outputs/plots/
+outputs/eval_plots/
+outputs/runs/
+outputs/*.png
+outputs/data_plots/*.png

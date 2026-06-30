@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from src.environment import StepState
 from src.threshold_policy import AlphaPolicy, compute_regimes
@@ -157,6 +158,45 @@ class REINFORCEAgent:
             step_hours=state.step_hours,
             fast=fast,
         )
+
+    def compute_gradients(
+        self, grad_clip: float = 1.0
+    ) -> tuple[float, dict[str, np.ndarray]]:
+        """
+        Compute REINFORCE loss + backward; return (loss_val, grad_dict).
+
+        Like update() but does NOT call optimizer.step().  Used by parallel
+        training workers: each worker calls compute_gradients(), the main
+        process averages the returned numpy grad arrays and applies one
+        optimizer step across all workers' episodes.
+
+        Clears log-prob and reward buffers (same as update()).
+        """
+        if len(self._log_probs) != len(self._rewards):
+            raise RuntimeError("log_prob / reward buffer length mismatch.")
+
+        returns = self._episode_returns()
+        loss    = torch.stack(
+            [-lp * G for lp, G in zip(self._log_probs, returns)]
+        ).sum()
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.policy.parameters(), grad_clip)
+
+        grad_dict: dict[str, np.ndarray] = {
+            name: (
+                p.grad.detach().numpy().copy()
+                if p.grad is not None
+                else np.zeros(p.shape, dtype=np.float32)
+            )
+            for name, p in self.policy.named_parameters()
+        }
+
+        loss_val = loss.item()
+        self._log_probs.clear()
+        self._rewards.clear()
+        return loss_val, grad_dict
 
     def param_snapshot(self) -> dict[str, float]:
         return self.policy.param_snapshot()

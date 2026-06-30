@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
+
+import multiprocessing
 
 import numpy as np
 import pandas as pd
@@ -67,7 +70,20 @@ def _sample_hyperparams(seed: int) -> dict[str, float]:
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
-def _run_phase(
+def _apply_averaged_gradients(
+    agent     : "REINFORCEAgent",
+    grad_dicts: list[dict[str, np.ndarray]],
+) -> None:
+    """Average REINFORCE gradients from N workers and apply one optimizer step."""
+    agent.optimizer.zero_grad()
+    for name, param in agent.policy.named_parameters():
+        grads = [gd[name] for gd in grad_dicts if gd is not None]
+        if grads:
+            param.grad = torch.as_tensor(np.mean(grads, axis=0), dtype=param.dtype)
+    agent.optimizer.step()
+
+
+def _run_phase_sequential(
     day_index  : list[tuple],
     cim        : "pd.DataFrame",
     auc        : "pd.DataFrame",
@@ -79,10 +95,7 @@ def _run_phase(
     phase_label: str,
     logger     : "TrainingLogger | None" = None,
 ) -> None:
-    """Run `reps` repetitions over the first `n_days` of day_index at `stride`."""
-    print(f"\n[{phase_label}]  stride={stride}  reps={reps}")
-    print(f"{'ep':>6}  {'rep':>4}  {'reward':>12}  {'loss':>12}  {'steps':>7}")
-    print("─" * 56)
+    """Original sequential training: one episode → one gradient update."""
     ep_global = 0
 
     for rep in range(1, reps + 1):
@@ -130,7 +143,6 @@ def _run_phase(
 
             print(f"{ep_global:6d}  {rep:4d}  {total_reward:12.2f}  {loss:12.4f}  {n_steps:7d}")
 
-        # one full pass through training data complete — record rep snapshot
         if logger is not None and rep_rewards:
             logger.log_rep(
                 phase         = phase_label,
@@ -140,7 +152,182 @@ def _run_phase(
             )
 
 
+def _run_phase_parallel(
+    day_index      : list[tuple],
+    cim            : "pd.DataFrame",
+    auc            : "pd.DataFrame",
+    env            : MultiHourMarketEnv,
+    agent          : "REINFORCEAgent",
+    n_days         : int,
+    reps           : int,
+    stride         : int,
+    phase_label    : str,
+    logger         : "TrainingLogger | None",
+    workers        : int,
+    round_trip_eff : float,
+    lr             : float,
+) -> None:
+    """
+    Parallel training: N episodes run simultaneously → gradients averaged →
+    one optimizer step per batch.  Equivalent to mini-batch REINFORCE with
+    batch size = workers (lower variance than single-episode updates).
+    """
+    import src.parallel_worker as _pw
+
+    # Expose DataFrames to workers via fork-inherited module globals.
+    # On Linux (fork), children read these at zero copy cost.
+    _pw._g_cim       = cim
+    _pw._g_auc       = auc
+    _pw._g_day_index = day_index
+
+    env_kwargs = dict(
+        capacity_mwh             = env.capacity,
+        max_charge_mw            = env.max_charge,
+        max_discharge_mw         = env.max_discharge,
+        efficiency               = env.one_way_eff ** 2,
+        initial_soc_mwh          = env.initial_soc,
+        terminal_penalty_eur_mwh = env.terminal_penalty,
+    )
+
+    ep_global = 0
+
+    with multiprocessing.get_context("fork").Pool(workers) as pool:
+        for rep in range(1, reps + 1):
+            rep_rewards: list[float] = []
+
+            for batch_start in range(0, n_days, workers):
+                batch_idx = list(range(batch_start, min(batch_start + workers, n_days)))
+
+                # Broadcast current parameters to workers (12 scalar tensors — tiny)
+                policy_sd = {
+                    k: v.detach().clone()
+                    for k, v in agent.policy.state_dict().items()
+                }
+
+                tasks = [
+                    {
+                        "ep_idx"        : ep_idx,
+                        "policy_sd"     : policy_sd,
+                        "round_trip_eff": round_trip_eff,
+                        "n_levels"      : agent.policy.n_levels,
+                        "lr"            : lr,
+                        "env_kwargs"    : env_kwargs,
+                        "tick_stride"   : stride,
+                        "grad_clip"     : 1.0,
+                    }
+                    for ep_idx in batch_idx
+                ]
+
+                results = pool.map(_pw.train_episode_worker, tasks)
+
+                valid = [
+                    (g, r, l, s) for g, r, l, s in results if g is not None
+                ]
+                ep_global += len(batch_idx)
+
+                if not valid:
+                    continue
+
+                grad_dicts, rewards, losses, steps = zip(*valid)
+                _apply_averaged_gradients(agent, list(grad_dicts))
+
+                for r, l, s in zip(rewards, losses, steps):
+                    if logger is not None:
+                        logger.log_episode(phase_label, r, l)
+                    rep_rewards.append(r)
+                    print(
+                        f"{ep_global:6d}  {rep:4d}  {r:12.2f}  {l:12.4f}  {s:7d}"
+                    )
+
+            if logger is not None and rep_rewards:
+                logger.log_rep(
+                    phase         = phase_label,
+                    local_rep     = rep,
+                    mean_reward   = float(np.mean(rep_rewards)),
+                    param_snapshot= agent.param_snapshot(),
+                )
+
+
+def _run_phase(
+    day_index  : list[tuple],
+    cim        : "pd.DataFrame",
+    auc        : "pd.DataFrame",
+    env        : MultiHourMarketEnv,
+    agent      : "REINFORCEAgent",
+    n_days     : int,
+    reps       : int,
+    stride     : int,
+    phase_label: str,
+    logger     : "TrainingLogger | None" = None,
+    workers    : int = 1,
+    round_trip_eff: float = 1.0,
+    lr         : float = 1e-3,
+) -> None:
+    """Run `reps` repetitions over the first `n_days` of day_index at `stride`."""
+    suffix = f"  workers={workers}" if workers > 1 else ""
+    print(f"\n[{phase_label}]  stride={stride}  reps={reps}{suffix}")
+    print(f"{'ep':>6}  {'rep':>4}  {'reward':>12}  {'loss':>12}  {'steps':>7}")
+    print("─" * 56)
+
+    if workers > 1:
+        _run_phase_parallel(
+            day_index, cim, auc, env, agent, n_days, reps, stride,
+            phase_label, logger, workers, round_trip_eff, lr,
+        )
+    else:
+        _run_phase_sequential(
+            day_index, cim, auc, env, agent, n_days, reps, stride,
+            phase_label, logger,
+        )
+
+
+def _write_hparams(path: Path, args: argparse.Namespace, hp: dict, run_dir: Path) -> None:
+    """Write a human-readable record of all training config to hparams.txt."""
+    lines = [
+        f"Run directory : {run_dir}",
+        f"Timestamp     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "=== Training Configuration ===",
+        f"  days           : {args.days}",
+        f"  reps           : {args.reps}",
+        f"  lr             : {args.lr}",
+        f"  seed           : {args.seed if args.seed is not None else 'None (fixed defaults)'}",
+        f"  n_levels       : {args.n_levels}",
+        f"  curriculum     : {args.curriculum}",
+        f"  workers        : {args.workers}",
+        "",
+        "=== Policy Hyperparameters (initial) ===",
+    ]
+    for k, v in hp.items():
+        lines.append(f"  {k:<18} : {v:+.4f}")
+    lines += [
+        "",
+        "=== Environment ===",
+        "  capacity_mwh        : 200.0",
+        "  max_charge_mw       : 50.0",
+        "  max_discharge_mw    : 50.0",
+        "  one_way_efficiency  : 0.95  (round-trip = 0.9025)",
+        "  initial_soc_mwh     : 0.0",
+        "  terminal_penalty    : 0.0",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
 def train(args: argparse.Namespace) -> None:
+    # ── Run directory ─────────────────────────────────────────────────────────
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.out is None:
+        run_dir  = Path("outputs/runs") / timestamp
+        out_path = run_dir / "model.pt"
+        plot_dir = run_dir / "training"
+    else:
+        out_path = Path(args.out)
+        run_dir  = out_path.parent
+        plot_dir = Path(args.plot_dir) if args.plot_dir else run_dir / "training"
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run directory : {run_dir}")
+
     # ── Hyperparameter initialisation ─────────────────────────────────────────
     if args.seed is not None:
         hp = _sample_hyperparams(args.seed)
@@ -152,6 +339,9 @@ def train(args: argparse.Namespace) -> None:
         print("No seed provided — using fixed default hyperparameters:")
     for k, v in hp.items():
         print(f"  {k:<18} = {v:+.4f}")
+
+    _write_hparams(run_dir / "hparams.txt", args, hp, run_dir)
+    print(f"Hyperparameters saved → {run_dir / 'hparams.txt'}")
 
     print("\nLoading data …")
     cim, auc = load_all(split="train")
@@ -187,17 +377,19 @@ def train(args: argparse.Namespace) -> None:
     finest_stride = 1
     finest_label = "1-sec" if tick_secs == 1 else "1-min"
 
+    common = dict(workers=args.workers, round_trip_eff=efficiency, lr=args.lr)
+
     if args.curriculum:
         # Three-phase curriculum: hourly → 15-min → 5-min (paper §VI-A)
         for stride, label in zip(phase_strides, ["hourly", "15-min", "5-min"]):
             _run_phase(day_index, cim, auc, env, agent,
-                       n_days, args.reps, stride, label, logger=logger)
+                       n_days, args.reps, stride, label, logger=logger, **common)
     else:
         _run_phase(day_index, cim, auc, env, agent,
-                   n_days, args.reps, finest_stride, finest_label, logger=logger)
+                   n_days, args.reps, finest_stride, finest_label,
+                   logger=logger, **common)
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -216,7 +408,7 @@ def train(args: argparse.Namespace) -> None:
     for k, v in agent.param_snapshot().items():
         print(f"  {k:<12} = {v:+.4f}")
 
-    logger.plot(out_dir=args.plot_dir)
+    logger.plot(out_dir=plot_dir)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -242,8 +434,8 @@ if __name__ == "__main__":
         help="Adam learning rate"
     )
     parser.add_argument(
-        "--out", type=str, default="outputs/models/policy_multihour.pt",
-        help="Output path for saved policy"
+        "--out", type=str, default=None,
+        help="Output path for saved model (default: outputs/runs/<timestamp>/model.pt)"
     )
     parser.add_argument(
         "--seed", type=int, default=None,
@@ -253,13 +445,22 @@ if __name__ == "__main__":
              "When omitted, fixed neutral defaults (_HP_DEFAULTS) are used."
     )
     parser.add_argument(
-        "--plot-dir", type=str, default="outputs/plots", dest="plot_dir",
-        help="Directory for training plots (default: outputs/plots)"
+        "--plot-dir", type=str, default=None, dest="plot_dir",
+        help="Directory for training plots (default: <run_dir>/training/)"
     )
     parser.add_argument(
         "--n-levels", type=int, default=1, dest="n_levels",
         help="Discrete quantity levels per side (paper §III-B). "
              "n=1: binary {0, max}; n=3: {0, max/3, 2*max/3, max}. "
              "Default 1 (effectively binary with our synthetic data depth)."
+    )
+    parser.add_argument(
+        "--workers", type=int, default=1,
+        help="Parallel worker processes for episode collection.  "
+             "N>1 runs N episodes concurrently and averages their REINFORCE "
+             "gradients before each optimizer step (mini-batch REINFORCE). "
+             "Uses fork-based multiprocessing — Linux/WSL2 only.  "
+             "Recommended: set to the number of physical CPU cores (e.g. 8 or 16). "
+             "Default: 1 (sequential, original behaviour)."
     )
     train(parser.parse_args())
