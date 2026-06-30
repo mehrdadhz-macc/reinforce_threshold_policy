@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/
+
+# Large data files (too large for GitHub)
+data/train/cim_order_book.csv
+data/test/cim_order_book.csv
+
+# Logs
+outputs/logs/
