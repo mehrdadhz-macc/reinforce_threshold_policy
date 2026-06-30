@@ -71,7 +71,6 @@ class REINFORCEAgent:
     ) -> None:
         """Compute buy/sell regimes from the 24-hour auction MID curve."""
 
-        # first compute the buy and sell regimes 
         regime = compute_regimes(auction_mids)
         self.policy.set_regime_info(regime)
         self.policy.set_env_params(capacity, initial_soc, max_charge, max_dis)

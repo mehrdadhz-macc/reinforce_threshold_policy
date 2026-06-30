@@ -130,7 +130,6 @@ def buy_midpoint_prices(
     return np.array([book_price_at_qty(asks, qm) for qm in q_mids], dtype=np.float64)
 
 
-
 def _sell_level_probs_ri(
     p_mids_desc  : torch.Tensor,   # shape (n_levels,), DESCENDING bid mid prices
     dist_Y       : Normal,          # main sell distribution: N(η·µ_Y, σ_Y) [financial, §V-G]
@@ -334,7 +333,6 @@ def compute_regimes(auction_mids: np.ndarray) -> dict[str, np.ndarray]:
     n = len(auction_mids)
     assert n == 24, f"Expected 24-hour auction curve, got length {n}"
 
-    # find the local minima and maxima on the auction curve 
     def _segment_boundaries(arr: np.ndarray, mode: str) -> list[int]:
         result = [0]
         for i in range(1, len(arr) - 1):

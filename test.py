@@ -16,68 +16,13 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.data_loader import load_all
+from src.data_loader import build_day_index, day_auction_mids, load_all
 from src.environment import MultiHourMarketEnv
 from src.threshold_policy import AlphaPolicy, compute_regimes
-
-
-# ── Helpers shared with train.py ──────────────────────────────────────────────
-
-def _day_auction_mids(
-    auc            : pd.DataFrame,
-    delivery_starts: list[pd.Timestamp],
-) -> np.ndarray | None:
-    sell_best = (
-        auc[auc["side"] == "sell"]
-        .groupby("delivery_start")["price_eur_mwh"]
-        .min()
-    )
-    buy_best = (
-        auc[auc["side"] == "buy"]
-        .groupby("delivery_start")["price_eur_mwh"]
-        .max()
-    )
-    mids = ((sell_best + buy_best) / 2).to_dict()
-
-    result = []
-    for ds in delivery_starts:
-        if ds not in mids:
-            return None
-        result.append(mids[ds])
-    return np.array(result, dtype=np.float64)
-
-
-def _build_day_index(
-    cim: pd.DataFrame,
-    auc: pd.DataFrame,
-) -> list[tuple]:
-    cim = cim.copy()
-    cim["berlin_date"] = (
-        cim["delivery_start"]
-        .dt.tz_convert("Europe/Berlin")
-        .dt.normalize()
-    )
-    auc_delivery_set = set(auc["delivery_start"].unique())
-
-    days = []
-    for day, group in cim.groupby("berlin_date"):
-        delivery_starts = sorted(group["delivery_start"].unique().tolist())
-        if len(delivery_starts) != 24:
-            continue
-        if not all(ds in auc_delivery_set for ds in delivery_starts):
-            continue
-        session_berlin = (day - pd.Timedelta(days=1)).replace(
-            hour=15, minute=0, second=0
-        )
-        session_utc = session_berlin.tz_convert("UTC")
-        days.append((day, delivery_starts, session_utc))
-
-    return sorted(days, key=lambda x: x[0])
 
 
 # ── Evaluation loop ───────────────────────────────────────────────────────────
@@ -105,7 +50,7 @@ def evaluate(args: argparse.Namespace) -> None:
     print("\nLoading test data …")
     cim, auc = load_all(split="test")
 
-    day_index = _build_day_index(cim, auc)
+    day_index = build_day_index(cim, auc)
     n_days    = min(args.days, len(day_index)) if args.days else len(day_index)
     print(f"Days available: {len(day_index)}  |  evaluating on {n_days}\n")
 
@@ -130,7 +75,7 @@ def evaluate(args: argparse.Namespace) -> None:
             day_cim = cim[cim["delivery_start"].isin(delivery_starts)]
             day_auc = auc[auc["delivery_start"].isin(delivery_starts)]
 
-            auction_mids = _day_auction_mids(day_auc, delivery_starts)
+            auction_mids = day_auction_mids(day_auc, delivery_starts)
             if auction_mids is None:
                 print(f"{ep_idx+1:5d}  {str(day.date()):<12}  skipped (missing auction data)")
                 continue

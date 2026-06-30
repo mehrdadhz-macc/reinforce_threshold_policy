@@ -21,9 +21,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import numpy as np
-
-from src.data_loader import load_all
+from src.data_loader import build_day_index, day_auction_mids, load_all
 from src.environment import MultiHourMarketEnv
 from src.reinforce_trainer import REINFORCEAgent
 from src.training_logger import TrainingLogger
@@ -67,74 +65,6 @@ def _sample_hyperparams(seed: int) -> dict[str, float]:
     return {k: float(rng.uniform(lo, hi)) for k, (lo, hi) in _HP_RANGES.items()}
 
 
-# ── Auction feature helpers ───────────────────────────────────────────────────
-
-def _day_auction_mids(
-    auc            : pd.DataFrame,
-    delivery_starts: list[pd.Timestamp],
-) -> np.ndarray | None:
-    """
-    Compute per-hour D-1 auction MID = (best_ask + best_bid) / 2 from the
-    full auction order book.  Returns shape-(24,) array or None if any hour
-    is missing.
-    """
-    sell_best = (
-        auc[auc["side"] == "sell"]
-        .groupby("delivery_start")["price_eur_mwh"]
-        .min()
-    )
-    buy_best = (
-        auc[auc["side"] == "buy"]
-        .groupby("delivery_start")["price_eur_mwh"]
-        .max()
-    )
-    mids = ((sell_best + buy_best) / 2).to_dict()
-
-    result = []
-    for ds in delivery_starts:
-        if ds not in mids:
-            return None
-        result.append(mids[ds])
-    return np.array(result, dtype=np.float64)
-
-
-# ── Day index ─────────────────────────────────────────────────────────────────
-
-def _build_day_index(
-    cim: pd.DataFrame,
-    auc: pd.DataFrame,
-) -> list[tuple]:
-    """
-    Returns sorted list of (berlin_day, delivery_starts, session_start_utc).
-
-    Only days with exactly 24 delivery hours in both CIM and auction data are
-    included.  session_start = 15:00 D-1 in Berlin time, expressed in UTC.
-    """
-    cim = cim.copy()
-    cim["berlin_date"] = (
-        cim["delivery_start"]
-        .dt.tz_convert("Europe/Berlin")
-        .dt.normalize()
-    )
-    auc_delivery_set = set(auc["delivery_start"].unique())
-
-    days = []
-    for day, group in cim.groupby("berlin_date"):
-        delivery_starts = sorted(group["delivery_start"].unique().tolist())
-        if len(delivery_starts) != 24:
-            continue
-        if not all(ds in auc_delivery_set for ds in delivery_starts):
-            continue
-        # 15:00 on D-1 in Berlin time → UTC
-        session_berlin = (day - pd.Timedelta(days=1)).replace(
-            hour=15, minute=0, second=0
-        )
-        session_utc = session_berlin.tz_convert("UTC")
-        days.append((day, delivery_starts, session_utc))
-
-    return sorted(days, key=lambda x: x[0])
-
-
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def _run_phase(
@@ -166,7 +96,7 @@ def _run_phase(
             day_cim = cim[cim["delivery_start"].isin(delivery_starts)]
             day_auc = auc[auc["delivery_start"].isin(delivery_starts)]
 
-            auction_mids = _day_auction_mids(day_auc, delivery_starts)
+            auction_mids = day_auction_mids(day_auc, delivery_starts)
             if auction_mids is None:
                 continue
             if auction_mids.max() - auction_mids.min() <= 0:
@@ -226,7 +156,7 @@ def train(args: argparse.Namespace) -> None:
     print("\nLoading data …")
     cim, auc = load_all(split="train")
 
-    day_index = _build_day_index(cim, auc)
+    day_index = build_day_index(cim, auc)
     n_days    = min(args.days, len(day_index))
     print(f"Days available: {len(day_index)}  |  training on first {n_days}")
 
@@ -257,8 +187,6 @@ def train(args: argparse.Namespace) -> None:
     finest_stride = 1
     finest_label = "1-sec" if tick_secs == 1 else "1-min"
 
-    # if we would like to train on multiple different time steps 
-    # paper follows hourly, 15mins, 5mins
     if args.curriculum:
         # Three-phase curriculum: hourly → 15-min → 5-min (paper §VI-A)
         for stride, label in zip(phase_strides, ["hourly", "15-min", "5-min"]):

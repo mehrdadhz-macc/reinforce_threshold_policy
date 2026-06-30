@@ -25,10 +25,10 @@ from src.data_loader import load_all
 from src.environment import MultiHourMarketEnv, N_HOURS
 from src.reinforce_trainer import REINFORCEAgent
 from src.ri_benchmark import run_ri_benchmark
+from src.data_loader import build_day_index, day_auction_mids
 from src.eval_plots import (
     DayResult, ThresholdData, TickRecord, save_all_plots,
 )
-from train import _build_day_index, _day_auction_mids
 
 
 # ── Episode runner ─────────────────────────────────────────────────────────────
@@ -144,7 +144,7 @@ def evaluate(args: argparse.Namespace) -> None:
     print(f"\nLoading {args.split} data …")
     cim, auc = load_all(split=args.split)
 
-    day_index = _build_day_index(cim, auc)
+    day_index = build_day_index(cim, auc)
     n_days    = min(args.days, len(day_index)) if args.days else len(day_index)
     day_index = day_index[:n_days]
     print(f"Test days: {n_days}")
@@ -180,7 +180,7 @@ def evaluate(args: argparse.Namespace) -> None:
         day_cim = cim[cim["delivery_start"].isin(delivery_starts)]
         day_auc = auc[auc["delivery_start"].isin(delivery_starts)]
 
-        auction_mids = _day_auction_mids(day_auc, delivery_starts)
+        auction_mids = day_auction_mids(day_auc, delivery_starts)
         if auction_mids is None or auction_mids.max() - auction_mids.min() <= 0:
             continue
 
