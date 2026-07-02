@@ -10,11 +10,11 @@ The paper proposes a parametric threshold policy for a battery storage unit trad
 project_root/
   data/
     train/
-      intraday_auction_curves.csv   # D-1 auction curves (Jan 2023, seed=42)
-      cim_order_book.csv            # CIM order book — not tracked (>800 MB)
+      intraday_auction_curves.csv   # D-1 auction curves (Jan–Jun 2023, seed=42) — generated locally, not tracked
+      cim_order_book.csv            # CIM order book — generated locally, not tracked
     test/
-      intraday_auction_curves.csv   # D-1 auction curves (Apr 2023, seed=123)
-      cim_order_book.csv            # CIM order book — not tracked (>3 GB)
+      intraday_auction_curves.csv   # D-1 auction curves (Aug 2023, seed=123) — generated locally, not tracked
+      cim_order_book.csv            # CIM order book — generated locally, not tracked
 
   scripts/
     data_generation/
@@ -53,12 +53,12 @@ venv/bin/pip install -r requirements.txt   # numpy, pandas, torch, scipy, matplo
 
 ## Generate data
 
-**Training data** (seed=42, 2023-01-01 – 2023-01-30):
+**Training data** (seed=42, 2023-01-01 – 2023-06-30, 181 days):
 ```bash
 venv/bin/python3 scripts/data_generation/generate_train_data.py
 ```
 
-**Test data** (seed=123, 2023-04-01 – 2023-04-30):
+**Test data** (seed=123, 2023-08-01 – 2023-08-31, 31 days, held out after training period):
 ```bash
 venv/bin/python3 scripts/data_generation/generate_test_data.py
 ```

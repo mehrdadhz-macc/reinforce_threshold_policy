@@ -30,11 +30,12 @@ import pandas as pd
 
 SEED       = 123
 TIMEZONE   = "Europe/Berlin"
-N_DAYS     = 2
-START_DATE = "2023-04-01"
+N_DAYS     = 31   # 1 month: August 2023 (held-out, after training period)
+START_DATE = "2023-08-01"
 
-# Tick frequency: "s" = 1-second (paper §VI-A), "min" = 1-minute (faster)
-TICK_FREQ  = "s"
+# Tick frequency: "s" = 1-second (paper §VI-A), "min" = 1-minute (practical default)
+# 30 days at "s" resolution requires ~50 GB; "min" is used for synthetic data.
+TICK_FREQ  = "min"
 
 N_CIM_LEVELS     = 5
 N_AUCTION_LEVELS = 10

@@ -27,10 +27,11 @@ import pandas as pd
 # ─── Configuration ────────────────────────────────────────────────────────────
 SEED       = 42
 TIMEZONE   = "Europe/Berlin"
-N_DAYS     = 30
+N_DAYS     = 181   # 6 months: Jan–Jun 2023 (31+28+31+30+31+30)
 START_DATE = "2023-01-01"
 
 # Tick frequency: "s" = 1-second (paper §VI-A), "min" = 1-minute (practical default)
+# 200 days at "s" resolution requires ~200 GB; "min" is used for synthetic data.
 TICK_FREQ = "min"
 
 N_CIM_LEVELS     = 5
@@ -220,13 +221,31 @@ def _check_spread(df: pd.DataFrame, group_cols: list[str], label: str) -> None:
         )
 
 
+def _is_dst_transition_day(day: pd.Timestamp) -> bool:
+    """Return True if the day has a DST gap or fold (wall-clock ≠ 24 hours).
+
+    pd.DateOffset(days=1) advances by one calendar day in local time, so the
+    UTC difference is 82800s (spring-forward) or 90000s (fall-back) rather
+    than always 86400s as pd.Timedelta(days=1) would give.
+    """
+    midnight_start = day.normalize()
+    midnight_end   = midnight_start + pd.DateOffset(days=1)
+    diff_s = (midnight_end.tz_convert("UTC") - midnight_start.tz_convert("UTC")).total_seconds()
+    return diff_s != 86400
+
+
 if __name__ == "__main__":
     np.random.seed(SEED)
     CIM_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    delivery_days = pd.date_range(
-        START_DATE, periods=N_DAYS, freq="D", tz=TIMEZONE
+    all_days = pd.date_range(START_DATE, periods=N_DAYS, freq="D", tz=TIMEZONE)
+    delivery_days = pd.DatetimeIndex(
+        [d for d in all_days if not _is_dst_transition_day(d)]
     )
+    skipped = len(all_days) - len(delivery_days)
+    if skipped:
+        print(f"Skipped {skipped} DST transition day(s): "
+              f"{[str(d.date()) for d in all_days if _is_dst_transition_day(d)]}")
 
     t0 = time.time()
     auction_df = generate_auction_curves(delivery_days)

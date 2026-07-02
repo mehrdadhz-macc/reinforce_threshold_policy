@@ -16,9 +16,11 @@ build/
 # Claude Code local settings
 .claude/
 
-# Large data files (too large for GitHub)
+# Data files (generated locally, not tracked)
 data/train/cim_order_book.csv
 data/test/cim_order_book.csv
+data/train/intraday_auction_curves.csv
+data/test/intraday_auction_curves.csv
 
 # Logs
 outputs/logs/
