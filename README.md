@@ -1,6 +1,6 @@
 # REINFORCE Threshold Policy for Intraday Electricity Markets
 
-Replication of **Bertrand & Papavasiliou (2020)** — *Adaptive Trading in Continuous Intraday Electricity Markets for a Storage Unit*.
+Replication of **Bertrand & Papavasiliou (2020)** — [*Adaptive Trading in Continuous Intraday Electricity Markets for a Storage Unit*](https://doi.org/10.1109/TPWRS.2019.2957246) (IEEE Transactions on Power Systems, 35(3), 2339–2350). The paper's supplementary appendix (reviewer-response proofs, computational scalability, and learning-stability checks) is kept locally as `appendix_transaction_final_V2.pdf` alongside the main paper PDF -- neither is tracked in this repo, see `.gitignore`.
 
 The paper proposes a parametric threshold policy for a battery storage unit trading on a continuous intraday electricity market (CIM). Policy parameters are learned via REINFORCE. One episode covers a full 24-hour Berlin trading day; the agent trades all delivery hours jointly, tick by tick.
 
@@ -156,4 +156,4 @@ Actions are sampled from a Gaussian threshold distribution (paper §IV-B) and up
 
 ## Reference
 
-Bertrand, G., & Papavasiliou, A. (2020). Adaptive Trading in Continuous Intraday Electricity Markets for a Storage Unit. *IEEE Transactions on Power Systems*, 35(3), 2339–2350.
+Bertrand, G., & Papavasiliou, A. (2020). Adaptive Trading in Continuous Intraday Electricity Markets for a Storage Unit. *IEEE Transactions on Power Systems*, 35(3), 2339–2350. https://doi.org/10.1109/TPWRS.2019.2957246

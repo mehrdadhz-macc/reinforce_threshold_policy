@@ -83,6 +83,20 @@ def _apply_averaged_gradients(
     agent.optimizer.step()
 
 
+def _is_plateaued(rep_means: list[float], window: int, tol: float) -> bool:
+    """
+    True once the rolling per-rep mean reward has stopped improving by more
+    than `tol` (relative) between the previous and current `window`-rep
+    blocks (paper §VI-A, footnote 7: switch frequency once profit stabilises).
+    """
+    if len(rep_means) < 2 * window:
+        return False
+    prev = float(np.mean(rep_means[-2 * window : -window]))
+    curr = float(np.mean(rep_means[-window:]))
+    denom = max(abs(prev), 1.0)
+    return (curr - prev) / denom < tol
+
+
 def _run_phase_sequential(
     day_index  : list[tuple],
     cim        : "pd.DataFrame",
@@ -90,15 +104,34 @@ def _run_phase_sequential(
     env        : MultiHourMarketEnv,
     agent      : "REINFORCEAgent",
     n_days     : int,
-    reps       : int,
+    reps       : int | float,
     stride     : int,
     phase_label: str,
     logger     : "TrainingLogger | None" = None,
+    plateau_window    : int   = 10,
+    plateau_tol       : float = 0.02,
+    max_reps_per_phase: int   = 500,
 ) -> None:
-    """Original sequential training: one episode → one gradient update."""
-    ep_global = 0
+    """
+    Original sequential training: one episode → one gradient update.
 
-    for rep in range(1, reps + 1):
+    If `reps` is finite, runs exactly that many passes (original behaviour).
+    If `reps` is inf, runs until the rolling per-rep mean reward stabilises
+    (§VI-A footnote 7), capped at `max_reps_per_phase` as a safety net.
+    """
+    ep_global = 0
+    rep_means: list[float] = []
+    rep = 0
+
+    while True:
+        rep += 1
+        if reps != float("inf") and rep > reps:
+            break
+        if reps == float("inf") and rep > max_reps_per_phase:
+            print(f"[{phase_label}] reached max_reps_per_phase={max_reps_per_phase} "
+                  f"without detecting a plateau; stopping phase.")
+            break
+
         rep_rewards: list[float] = []
 
         for ep_idx in range(n_days):
@@ -143,13 +176,21 @@ def _run_phase_sequential(
 
             print(f"{ep_global:6d}  {rep:4d}  {total_reward:12.2f}  {loss:12.4f}  {n_steps:7d}")
 
-        if logger is not None and rep_rewards:
-            logger.log_rep(
-                phase         = phase_label,
-                local_rep     = rep,
-                mean_reward   = float(np.mean(rep_rewards)),
-                param_snapshot= agent.param_snapshot(),
-            )
+        if rep_rewards:
+            mean_reward = float(np.mean(rep_rewards))
+            rep_means.append(mean_reward)
+            if logger is not None:
+                logger.log_rep(
+                    phase         = phase_label,
+                    local_rep     = rep,
+                    mean_reward   = mean_reward,
+                    param_snapshot= agent.param_snapshot(),
+                )
+
+        if reps == float("inf") and _is_plateaued(rep_means, plateau_window, plateau_tol):
+            print(f"[{phase_label}] profit stabilised after {rep} reps "
+                  f"(window={plateau_window}, tol={plateau_tol:.1%}) — advancing phase.")
+            break
 
 
 def _run_phase_parallel(
@@ -159,13 +200,16 @@ def _run_phase_parallel(
     env            : MultiHourMarketEnv,
     agent          : "REINFORCEAgent",
     n_days         : int,
-    reps           : int,
+    reps           : int | float,
     stride         : int,
     phase_label    : str,
     logger         : "TrainingLogger | None",
     workers        : int,
     round_trip_eff : float,
     lr             : float,
+    plateau_window    : int   = 10,
+    plateau_tol       : float = 0.02,
+    max_reps_per_phase: int   = 500,
 ) -> None:
     """
     Parallel training: N episodes run simultaneously → gradients averaged →
@@ -190,9 +234,19 @@ def _run_phase_parallel(
     )
 
     ep_global = 0
+    rep_means: list[float] = []
+    rep = 0
 
     with multiprocessing.get_context("fork").Pool(workers) as pool:
-        for rep in range(1, reps + 1):
+        while True:
+            rep += 1
+            if reps != float("inf") and rep > reps:
+                break
+            if reps == float("inf") and rep > max_reps_per_phase:
+                print(f"[{phase_label}] reached max_reps_per_phase={max_reps_per_phase} "
+                      f"without detecting a plateau; stopping phase.")
+                break
+
             rep_rewards: list[float] = []
 
             for batch_start in range(0, n_days, workers):
@@ -239,13 +293,21 @@ def _run_phase_parallel(
                         f"{ep_global:6d}  {rep:4d}  {r:12.2f}  {l:12.4f}  {s:7d}"
                     )
 
-            if logger is not None and rep_rewards:
-                logger.log_rep(
-                    phase         = phase_label,
-                    local_rep     = rep,
-                    mean_reward   = float(np.mean(rep_rewards)),
-                    param_snapshot= agent.param_snapshot(),
-                )
+            if rep_rewards:
+                mean_reward = float(np.mean(rep_rewards))
+                rep_means.append(mean_reward)
+                if logger is not None:
+                    logger.log_rep(
+                        phase         = phase_label,
+                        local_rep     = rep,
+                        mean_reward   = mean_reward,
+                        param_snapshot= agent.param_snapshot(),
+                    )
+
+            if reps == float("inf") and _is_plateaued(rep_means, plateau_window, plateau_tol):
+                print(f"[{phase_label}] profit stabilised after {rep} reps "
+                      f"(window={plateau_window}, tol={plateau_tol:.1%}) — advancing phase.")
+                break
 
 
 def _run_phase(
@@ -255,17 +317,30 @@ def _run_phase(
     env        : MultiHourMarketEnv,
     agent      : "REINFORCEAgent",
     n_days     : int,
-    reps       : int,
+    reps       : int | float,
     stride     : int,
     phase_label: str,
     logger     : "TrainingLogger | None" = None,
     workers    : int = 1,
     round_trip_eff: float = 1.0,
     lr         : float = 1e-3,
+    plateau_window    : int   = 10,
+    plateau_tol       : float = 0.02,
+    max_reps_per_phase: int   = 500,
 ) -> None:
-    """Run `reps` repetitions over the first `n_days` of day_index at `stride`."""
+    """
+    Run `reps` repetitions over the first `n_days` of day_index at `stride`.
+
+    reps=inf trains until the rolling per-rep mean reward stabilises instead
+    of a fixed count (§VI-A footnote 7), capped at `max_reps_per_phase`.
+    """
     suffix = f"  workers={workers}" if workers > 1 else ""
-    print(f"\n[{phase_label}]  stride={stride}  reps={reps}{suffix}")
+    if reps == float("inf"):
+        reps_desc = (f"reps=inf (until plateau: window={plateau_window}, "
+                     f"tol={plateau_tol:.1%}, max={max_reps_per_phase})")
+    else:
+        reps_desc = f"reps={reps}"
+    print(f"\n[{phase_label}]  stride={stride}  {reps_desc}{suffix}")
     print(f"{'ep':>6}  {'rep':>4}  {'reward':>12}  {'loss':>12}  {'steps':>7}")
     print("─" * 56)
 
@@ -273,11 +348,14 @@ def _run_phase(
         _run_phase_parallel(
             day_index, cim, auc, env, agent, n_days, reps, stride,
             phase_label, logger, workers, round_trip_eff, lr,
+            plateau_window, plateau_tol, max_reps_per_phase,
         )
     else:
         _run_phase_sequential(
             day_index, cim, auc, env, agent, n_days, reps, stride,
             phase_label, logger,
+            plateau_window=plateau_window, plateau_tol=plateau_tol,
+            max_reps_per_phase=max_reps_per_phase,
         )
 
 
@@ -295,6 +373,14 @@ def _write_hparams(path: Path, args: argparse.Namespace, hp: dict, run_dir: Path
         f"  n_levels       : {args.n_levels}",
         f"  curriculum     : {args.curriculum}",
         f"  workers        : {args.workers}",
+    ]
+    if args.reps == float("inf"):
+        lines += [
+            f"  plateau_window : {args.plateau_window}",
+            f"  plateau_tol    : {args.plateau_tol}",
+            f"  max_reps/phase : {args.max_reps_per_phase}",
+        ]
+    lines += [
         "",
         "=== Policy Hyperparameters (initial) ===",
     ]
@@ -377,7 +463,11 @@ def train(args: argparse.Namespace) -> None:
     finest_stride = 1
     finest_label = "1-sec" if tick_secs == 1 else "1-min"
 
-    common = dict(workers=args.workers, round_trip_eff=efficiency, lr=args.lr)
+    common = dict(
+        workers=args.workers, round_trip_eff=efficiency, lr=args.lr,
+        plateau_window=args.plateau_window, plateau_tol=args.plateau_tol,
+        max_reps_per_phase=args.max_reps_per_phase,
+    )
 
     if args.curriculum:
         # Three-phase curriculum: hourly → 15-min → 5-min (paper §VI-A)
@@ -413,6 +503,13 @@ def train(args: argparse.Namespace) -> None:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def _reps_type(value: str) -> int | float:
+    """Accept a positive int, or 'inf' to train each phase until profit plateaus."""
+    if value.strip().lower() in ("inf", "infinity"):
+        return float("inf")
+    return int(value)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train B&P multi-hour REINFORCE policy"
@@ -422,8 +519,27 @@ if __name__ == "__main__":
         help="Number of training days (default: 200, matching paper §VI-A)"
     )
     parser.add_argument(
-        "--reps", type=int, default=4,
-        help="Repetitions over training days per curriculum phase (default: 4, matching paper)"
+        "--reps", type=_reps_type, default=4,
+        help="Repetitions over training days per curriculum phase (default: 4). "
+             "Pass 'inf' to instead train each phase until profit stabilises "
+             "(paper §VI-A footnote 7: switch frequency once profit plateaus), "
+             "bounded by --max-reps-per-phase as a safety cap."
+    )
+    parser.add_argument(
+        "--plateau-window", type=int, default=10, dest="plateau_window",
+        help="Number of reps averaged together when checking for profit "
+             "stabilisation. Only used with --reps inf. Default: 10."
+    )
+    parser.add_argument(
+        "--plateau-tol", type=float, default=0.02, dest="plateau_tol",
+        help="Relative improvement threshold (of the previous window's mean "
+             "reward) below which profit is considered stabilised. Only used "
+             "with --reps inf. Default: 0.02 (2%%)."
+    )
+    parser.add_argument(
+        "--max-reps-per-phase", type=int, default=500, dest="max_reps_per_phase",
+        help="Safety cap on reps per phase when --reps inf never detects a "
+             "plateau. Default: 500."
     )
     parser.add_argument(
         "--curriculum", action="store_true",

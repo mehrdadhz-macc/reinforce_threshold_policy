@@ -16,6 +16,10 @@ build/
 # Claude Code local settings
 .claude/
 
+# Source paper PDF + supplementary appendix kept locally for reference,
+# not pushed to GitHub -- see the README for a link to the paper instead.
+*.pdf
+
 # Data files (generated locally, not tracked)
 data/train/cim_order_book.csv
 data/test/cim_order_book.csv
